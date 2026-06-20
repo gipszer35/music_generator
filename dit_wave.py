@@ -1,18 +1,21 @@
 import sys
+import os
 import torch
 import torchaudio
-import os
 import random
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from IPython.display import Audio, display
-import os
 import datetime
 import matplotlib.pyplot as plt
 import torchaudio.transforms as T
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
+import tarfile
+import urllib.request
+from transformers import EncodecModel, AutoProcessor
+from functools import lru_cache
 
 
 def is_colab():
@@ -25,12 +28,10 @@ class Config:
     work_dir: str
     batch_size: int
 
-    sr: int = 8000
     seconds: int = 1
-    epochs: int = 2000000
+    epochs: int = 2_000_000
     timesteps: int = 400
-    audio_dir = "nsynth-test/audio"
-    lr = 5e-5
+    lr: float = 5e-5
 
     @property
     def out_dir(self):
@@ -39,10 +40,6 @@ class Config:
     @property
     def model_file(self):
         return os.path.join(self.out_dir, "dit_wave.pt")
-
-    @property
-    def clip_len(self):
-        return int(config.sr * self.seconds)
 
 
 def create_config() -> Config:
@@ -61,6 +58,24 @@ def create_config() -> Config:
         batch_size = 2
 
     return Config(root_dir=root_dir, work_dir=work_dir, batch_size=batch_size)
+
+
+@dataclass
+class AudioCodecComponents:
+    model: EncodecModel
+    processor: AutoProcessor
+
+
+class AudioCodecFactory:
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def create(model_name: str = "facebook/encodec_24khz"):
+        model = EncodecModel.from_pretrained(model_name)
+        processor = AutoProcessor.from_pretrained(model_name)
+
+        model.eval()
+
+        return AudioCodecComponents(model=model, processor=processor)
 
 
 class DiffusionSchedule:
@@ -92,44 +107,92 @@ def ensure_dir(path):
         logger.info(f"Created directory: {path}")
 
 
-url = (
-    "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz"
-)
-
-if not os.path.exists("nsynth-test"):
-    !wget $url
-    !tar -xzf nsynth-test.jsonwav.tar.gz
-
 class NSynthSubset(Dataset):
-    def __init__(self, root, instrument="keyboard"):
-        self.paths = []
-        for f in os.listdir(root):
-            if f.endswith(".wav"):
-                if instrument in f:
-                    self.paths.append(os.path.join(root, f))
+    URL = "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz"
+    ARCHIVE = "nsynth-test.jsonwav.tar.gz"
+    DATASET_DIR = "nsynth-test"
+
+    def __init__(self, sample_rate: int):
+        self.sample_rate = sample_rate
+        self.clip_len = sample_rate * config.seconds
+
+        self._prepare()
+
+        audio_dir = os.path.join(config.out_dir, self.DATASET_DIR, "audio")
+
+        self.paths = [
+            os.path.join(audio_dir, f)
+            for f in os.listdir(audio_dir)
+            if f.endswith(".wav")
+        ]
+
+    @classmethod
+    def _prepare(cls):
+        archive = os.path.join(config.out_dir, cls.ARCHIVE)
+        dataset_dir = os.path.join(config.out_dir, cls.DATASET_DIR)
+
+        if not os.path.isdir(dataset_dir):
+            if not os.path.isfile(archive):
+                print("Downloading NSynth...")
+                urllib.request.urlretrieve(cls.URL, archive)
+
+            print("Extracting NSynth...")
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(config.out_dir)
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, idx):
-        path = self.paths[idx]
-        wav, sr0 = torchaudio.load(path)
+        wav, sr = torchaudio.load(self.paths[idx])
+
+        # Mono
         if wav.shape[0] > 1:
-            # Convert to mono
             wav = wav.mean(dim=0, keepdim=True)
-        if sr0 != config.sr:
-            wav = torchaudio.transforms.Resample(sr0, config.sr)(wav)
-        if wav.shape[1] > config.clip_len:
-            start = random.randint(0, wav.shape[1] - config.clip_len)
-            wav = wav[:, start : start + config.clip_len]
+
+        # Resample to codec sample rate
+        if sr != self.sample_rate:
+            wav = torchaudio.functional.resample(
+                wav,
+                sr,
+                self.sample_rate,
+            )
+
+        # Random crop / pad
+        if wav.shape[1] > self.clip_len:
+            start = random.randint(0, wav.shape[1] - self.clip_len)
+            wav = wav[:, start : start + self.clip_len]
         else:
-            wav = torch.nn.functional.pad(wav, (0, config.clip_len - wav.shape[1]))
-        if wav.abs().max() > 0:
-            wav = wav / (wav.abs().max() + 1e-7)  # prevents divide-by-zero
+            wav = torch.nn.functional.pad(
+                wav,
+                (0, self.clip_len - wav.shape[1]),
+            )
+
+        peak = wav.abs().max()
+        if peak > 0:
+            wav = wav / peak
+
         return wav
 
 
-class SimpleUNet(nn.Module):
+class DACCollator:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, batch):
+        raw_audio = [x.squeeze(0).numpy() for x in batch]
+
+        return self.processor(
+            raw_audio=raw_audio,
+            sampling_rate=self.processor.sampling_rate,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        return inputs
+
+
+class DitWave(nn.Module):
     def __init__(self, time_hidden_size=256):
         super().__init__()
 
@@ -269,7 +332,7 @@ class CheckpointManager:
                 logger.info(f"Optimizer state not loaded: {e}")
 
     def load_model(self):
-        model = SimpleUNet().to(my.DEVICE)
+        model = DitWave().to(my.DEVICE)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
         if os.path.exists(config.model_file):
@@ -282,24 +345,24 @@ class CheckpointManager:
 
 class AudioVisualizer:
 
-    def show_generated_sample(self, generated_sample):
+    def show_generated_sample(self, generated_sample, sr):
         logger.info("Generating sample...")
-        display(Audio(generated_sample, rate=config.sr))
+        display(Audio(generated_sample, rate=sr))
 
-    def show_dataset_sample(self, dataset):
+    def show_dataset_sample(self, dataset, sr):
         index = random.randint(0, len(dataset) - 1)
         wav = dataset[index]
-        if isinstance(wav, tuple):  # in case your Dataset returns (wav, label)
+        if isinstance(wav, tuple):  # Dataset returns (wav, label)
             wav = wav[0]
         logger.info(f"Dataset sample at index {index}:")
-        display(Audio(wav.squeeze().numpy(), rate=config.sr))
+        display(Audio(wav.squeeze().numpy(), rate=sr))
 
-    def show_samples(self, generated_sample, dataset):
+    def show_samples(self, generated_sample, dataset, sr):
         logger.info(f"Date:{datetime.datetime.now()}")
-        self.show_generated_sample(generated_sample)
-        self.show_dataset_sample(dataset)
+        self.show_generated_sample(generated_sample, sr)
+        self.show_dataset_sample(dataset, sr)
 
-    def show_comparison_plot(self, clean, noisy, pred_denoised, sr=config.sr, title=""):
+    def show_comparison_plot(self, clean, noisy, pred_denoised, sr, title=""):
         def plot_waveform(ax, signal, label):
             ax.plot(signal.squeeze().cpu().numpy())
             ax.set_xlabel("Time")
@@ -383,10 +446,21 @@ class AudioVisualizer:
 
 class DitWaveTrainer:
     def __init__(self):
-        self.dataset = NSynthSubset(config.audio_dir)
-        self.loader = DataLoader(
-            self.dataset, batch_size=config.batch_size, shuffle=True
+        self.audio_codec_components = AudioCodecFactory.create()
+
+        self.sr = self.audio_codec_components.processor.sampling_rate
+
+        self.dataset = NSynthSubset(
+            sample_rate=self.sr,
         )
+
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=DACCollator(self.audio_codec_components.processor),
+        )
+
         self.checkpoint_manager = CheckpointManager()
         self.model, self.optimizer = self.checkpoint_manager.load_model()
         self.mse = nn.MSELoss()
@@ -436,6 +510,7 @@ class DitWaveTrainer:
                 clean=sample_x0,
                 noisy=x_t,
                 pred_denoised=denoised,
+                sr = self.sr,
                 title=f"Epoch {epoch}, Step {i} current t={t[0:1].item()}",
             )
         model.train()
@@ -483,22 +558,70 @@ class DitWaveTrainer:
                         f"Avg Loss: {avg_loss:.4f}"
                     )
                     generated_sample = (
-                        self.sample(self.model, config.timesteps, (1, 1, config.clip_len))
+                        self.sample(
+                            self.model, config.timesteps, (1, 1, self.dataset.clip_len)
+                        )
                         .cpu()
                         .squeeze()
                         .numpy()
                     )
-                    self.visualizer.show_samples(generated_sample, self.dataset)
+                    self.visualizer.show_samples(generated_sample, self.dataset, self.sr)
                     self.show_prot_graphs(self.model, epoch, step, x0, t, x_t)
 
                     self.model.train()
+
                 step += 1
+
+    def train2(self):
+        step = 0
+        self.model.train()
+
+        logger.info(
+            f"Training started! Number of data samples: {len(self.dataset)} | Batches: {len(self.loader)}"
+        )
+
+        # for epoch in range(config.epochs):
+        #     for _, x0 in enumerate(self.loader):
+        #         x0 = x0.to(my.DEVICE)
+
+        batch = next(iter(self.loader))
+        inputs = batch
+
+        print("x", inputs["input_values"].shape)
+        print("y", inputs["input_values"].dtype)
+
+        encoder_outputs = self.audio_codec_components.model.encode(
+            inputs["input_values"], inputs["padding_mask"]
+        )
+        audio_codes = encoder_outputs.audio_codes
+        audio_scales = encoder_outputs.audio_scales
+
+        decoder_output = self.audio_codec_components.model.decode(
+            audio_codes, audio_scales
+        )
+        reconstructed_audio = decoder_output.audio_values
+
+        print("Original sound")
+        display(
+            Audio(
+                inputs["input_values"][0],
+                rate=self.audio_codec_components.processor.sampling_rate,
+            )
+        )
+
+        print("\nGenerated sound")
+        display(
+            Audio(
+                reconstructed_audio[0].detach().cpu().numpy(),
+                rate=self.audio_codec_components.processor.sampling_rate,
+            )
+        )
 
 
 def train():
     ensure_dir(config.out_dir)
     trainer = DitWaveTrainer()
-    trainer.train()
+    trainer.train2()
 
 
 if __name__ == "__main__":
