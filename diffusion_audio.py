@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import tarfile
 import urllib.request
 from transformers import EncodecModel, AutoProcessor
-from functools import lru_cache
 
 
 def is_colab():
@@ -53,7 +52,7 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         work_dir = root_dir + "MusicGenerator/"
-        batch_size = 384
+        batch_size = 256 + 128
     else:
         root_dir = "./"
         work_dir = root_dir
@@ -86,6 +85,23 @@ schedule = DiffusionSchedule(my.DEVICE, config.timesteps)
 logger = my.create_logger()
 
 
+class SnakeActivation(nn.Module):
+    """
+    Snake activation function introduced in 'Neural Networks Learn Periodic Functions'
+    and utilized in Improved RVQGAN. It provides an inductive bias for learning
+    periodic signals and harmonics in audio synthesis.
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        # Trainable parameter to control the frequency of the periodic component
+        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+
+    def forward(self, x):
+        # Input shape: [Batch, Channels, Length]
+        return x + (1.0 / (self.alpha + 1e-9)) * torch.sin(self.alpha * x) ** 2
+
+
 class UNetBlock1D(nn.Module):
     def __init__(self, in_channels, out_channels, time_emb_dim):
         super().__init__()
@@ -94,21 +110,15 @@ class UNetBlock1D(nn.Module):
         self.gn1 = nn.GroupNorm(8, out_channels)
         self.act1 = nn.SiLU()
 
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.gn2 = nn.GroupNorm(8, out_channels)
-        self.act2 = nn.SiLU()
-
         if in_channels != out_channels:
             self.shortcut = nn.Conv1d(in_channels, out_channels, kernel_size=1)
         else:
             self.shortcut = nn.Identity()
 
     def forward(self, x, t_emb):
+        t = self.mlp(t_emb).unsqueeze(-1)  # shape: [B, out_channels, 1]
         h = self.act1(self.gn1(self.conv1(x)))
-        # Inject time embedding into the feature maps
-        h = h + self.mlp(t_emb).unsqueeze(-1)
-        h = self.act2(self.gn2(self.conv2(h)))
-        return h + self.shortcut(x)
+        return h + t + self.shortcut(x)
 
 
 class DiffusionWave(nn.Module):
@@ -116,55 +126,81 @@ class DiffusionWave(nn.Module):
         super().__init__()
         self.time_mlp = my.TimestepEmbedder(hidden_size=time_hidden_size)
 
-        self.init_conv = nn.Conv1d(
-            in_channels, model_channels, kernel_size=3, padding=1
-        )
+        # New channel multipliers
+        c1 = model_channels
+        c2 = model_channels * 2
+        c3 = model_channels * 2
+        c4 = model_channels * 4
+        c5 = model_channels * 8
 
-        self.down1 = UNetBlock1D(model_channels, model_channels, time_hidden_size)
-        self.down1_pool = nn.Conv1d(
-            model_channels, model_channels * 2, kernel_size=4, stride=2, padding=1
-        )
+        # Input projection
+        self.init_conv = nn.Conv1d(in_channels, c1, kernel_size=3, padding=1)
 
-        self.down2 = UNetBlock1D(
-            model_channels * 2, model_channels * 2, time_hidden_size
-        )
-        self.down2_pool = nn.Conv1d(
-            model_channels * 2, model_channels * 4, kernel_size=4, stride=2, padding=1
-        )
+        # Downsampling path
+        self.down1 = UNetBlock1D(c1, c1, time_hidden_size)
+        self.down1_pool = nn.Conv1d(c1, c2, kernel_size=4, stride=2, padding=1)
 
-        self.mid1 = UNetBlock1D(
-            model_channels * 4, model_channels * 4, time_hidden_size
-        )
-        self.mid2 = UNetBlock1D(
-            model_channels * 4, model_channels * 4, time_hidden_size
-        )
+        self.down2 = UNetBlock1D(c2, c2, time_hidden_size)
+        self.down2_pool = nn.Conv1d(c2, c3, kernel_size=4, stride=2, padding=1)
 
-        self.up2_unpool = nn.ConvTranspose1d(
-            model_channels * 4, model_channels * 2, kernel_size=4, stride=2, padding=1
-        )
-        self.up2 = UNetBlock1D(model_channels * 4, model_channels * 2, time_hidden_size)
+        self.down3 = UNetBlock1D(c3, c3, time_hidden_size)
+        self.down3_pool = nn.Conv1d(c3, c4, kernel_size=4, stride=2, padding=1)
 
-        self.up1_unpool = nn.ConvTranspose1d(
-            model_channels * 2, model_channels, kernel_size=4, stride=2, padding=1
-        )
-        self.up1 = UNetBlock1D(model_channels * 2, model_channels, time_hidden_size)
+        self.down4 = UNetBlock1D(c4, c4, time_hidden_size)
+        self.down4_pool = nn.Conv1d(c4, c5, kernel_size=4, stride=2, padding=1)
 
-        self.out_conv = nn.Conv1d(model_channels, in_channels, kernel_size=3, padding=1)
+        # Bottleneck
+        self.mid1 = UNetBlock1D(c5, c5, time_hidden_size)
+        self.mid2 = UNetBlock1D(c5, c5, time_hidden_size)
+
+        # Upsampling path
+        self.up4_unpool = nn.ConvTranspose1d(c5, c4, kernel_size=4, stride=2, padding=1)
+        self.up4 = UNetBlock1D(c4 + c4, c4, time_hidden_size)
+
+        self.up3_unpool = nn.ConvTranspose1d(c4, c3, kernel_size=4, stride=2, padding=1)
+        self.up3 = UNetBlock1D(c3 + c3, c3, time_hidden_size)
+
+        self.up2_unpool = nn.ConvTranspose1d(c3, c2, kernel_size=4, stride=2, padding=1)
+        self.up2 = UNetBlock1D(c2 + c2, c2, time_hidden_size)
+
+        self.up1_unpool = nn.ConvTranspose1d(c2, c1, kernel_size=4, stride=2, padding=1)
+        self.up1 = UNetBlock1D(c1 + c1, c1, time_hidden_size)
+
+        # Output projection
+        self.out_conv = nn.Conv1d(c1, in_channels, kernel_size=3, padding=1)
 
     def forward(self, x, t):
+        # Time embedding
         t_emb = self.time_mlp(t)
 
+        # Downsampling blocks + save skip connections
         x1 = self.init_conv(x)
         x1 = self.down1(x1, t_emb)
+
         x2 = self.down1_pool(x1)
-
         x2 = self.down2(x2, t_emb)
+
         x3 = self.down2_pool(x2)
+        x3 = self.down3(x3, t_emb)
 
-        x3 = self.mid1(x3, t_emb)
-        x3 = self.mid2(x3, t_emb)
+        x4 = self.down3_pool(x3)
+        x4 = self.down4(x4, t_emb)
 
-        x_up = self.up2_unpool(x3)
+        # Middle bottleneck
+        x_mid = self.down4_pool(x4)
+        x_mid = self.mid1(x_mid, t_emb)
+        x_mid = self.mid2(x_mid, t_emb)
+
+        # Upsampling blocks + concatenate skip connections
+        x_up = self.up4_unpool(x_mid)
+        x_up = torch.cat([x_up, x4], dim=1)
+        x_up = self.up4(x_up, t_emb)
+
+        x_up = self.up3_unpool(x_up)
+        x_up = torch.cat([x_up, x3], dim=1)
+        x_up = self.up3(x_up, t_emb)
+
+        x_up = self.up2_unpool(x_up)
         x_up = torch.cat([x_up, x2], dim=1)
         x_up = self.up2(x_up, t_emb)
 
@@ -172,8 +208,8 @@ class DiffusionWave(nn.Module):
         x_up = torch.cat([x_up, x1], dim=1)
         x_up = self.up1(x_up, t_emb)
 
+        # Final projection
         out = self.out_conv(x_up)
-
         return out
 
 
@@ -193,17 +229,22 @@ class DiffusionWaveTrainer:
             batch_size=config.batch_size,
             shuffle=True,
             collate_fn=audio_common.DACCollator(self.processor),
+            num_workers=2,
+            persistent_workers=True,  # Prevents RAM leaks across epochs
         )
 
         self.checkpoint_manager = audio_common.CheckpointManager(
             model_file=config.model_file, lr=config.lr, device=my.DEVICE, logger=logger
         )
         model = DiffusionWave(
-            in_channels=128, model_channels=256, time_hidden_size=512
+            in_channels=128, model_channels=128, time_hidden_size=512
         ).to(my.DEVICE)
         self.model, self.optimizer = self.checkpoint_manager.load_model(model)
         my.print_parameter_summary(self.model)
-        self.mse = nn.MSELoss()
+        self.evaluator = audio_common.AudioFidelityEvaluator(
+            self.encodec, sample_rate=44100, device=my.DEVICE
+        )
+
         self.loss_history = deque(maxlen=1000)
         self.visualizer = audio_common.AudioVisualizer(logger=logger)
 
@@ -229,8 +270,9 @@ class DiffusionWaveTrainer:
             else:
                 noise = 0
 
+            # Corrected standard DDPM equation
             x_t = (1 / alpha.sqrt()) * (
-                x_t - (1 - alpha) / (1 - alpha_bar).sqrt() * pred_noise
+                x_t - (beta / (1 - alpha_bar).sqrt()) * pred_noise
             ) + beta.sqrt() * noise
 
         audio_waveform = self.encodec.decoder(x_t)
@@ -271,7 +313,8 @@ class DiffusionWaveTrainer:
             f"Training started!\n"
             f"Number of data samples: {len(self.dataset)}\n"
             f"Batch Size: {config.batch_size}\n"
-            f"Batches: {len(self.loader)}"
+            f"Batches: {len(self.loader)}\n"
+            f"LR: {config.lr}"
         )
 
         for epoch in range(config.epochs):
@@ -290,7 +333,10 @@ class DiffusionWaveTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
 
                 pred = self.model(z_t, t)
-                loss = self.mse(pred, noise)
+
+                loss, loss_msg = self.evaluator.compute(
+                    pred_noise=pred, target_noise=noise, z_t=z_t, a_bar=a_bar, z_0=z_0
+                )
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -299,10 +345,12 @@ class DiffusionWaveTrainer:
 
                 avg_loss = self.update_avg_loss(loss.item())
 
-                if step % 50 == 0:
+                if step % 20 == 0:
                     self.model.eval()
 
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)
+                    if loss_msg:
+                        logger.info(loss_msg)
                     logger.info(
                         f"Epoch {epoch} "
                         f"Step {step} "
@@ -310,6 +358,7 @@ class DiffusionWaveTrainer:
                         f"Avg Loss: {avg_loss:.4f}"
                     )
                     generated_sample = self.sample().cpu().squeeze().numpy()
+
                     self.visualizer.show_samples(
                         generated_sample, self.dataset, self.sr
                     )
@@ -318,37 +367,6 @@ class DiffusionWaveTrainer:
                     self.model.train()
 
                 step += 1
-
-        inputs = next(iter(self.loader))
-
-        encoder_outputs = self.audio_codec_components.model.encode(
-            inputs["input_values"], inputs["padding_mask"]
-        )
-        audio_codes = encoder_outputs.audio_codes
-        audio_scales = encoder_outputs.audio_scales
-
-        decoder_output = self.audio_codec_components.model.decode(
-            audio_codes, audio_scales
-        )
-        reconstructed_audio = decoder_output.audio_values
-
-        print("Original sound")
-        display(
-            Audio(
-                inputs["input_values"][0],
-                rate=self.audio_codec_components.processor.sampling_rate,
-            )
-        )
-
-        print("\nGenerated sound")
-        display(
-            Audio(
-                reconstructed_audio[0].detach().cpu().numpy(),
-                rate=self.audio_codec_components.processor.sampling_rate,
-            )
-        )
-        logger.info(f"Inputs shape: {inputs["input_values"].shape}")
-        logger.info(f"outputs shape: {reconstructed_audio.shape}")
 
 
 def train():

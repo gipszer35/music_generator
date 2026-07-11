@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import tarfile
 import urllib.request
 from transformers import EncodecModel, AutoProcessor
-from functools import lru_cache
 
 
 @dataclass
@@ -26,7 +25,6 @@ class AudioCodecComponents:
 
 class AudioCodecFactory:
     @staticmethod
-    @lru_cache(maxsize=None)
     def create(device, model_name: str = "facebook/encodec_24khz"):
         model = EncodecModel.from_pretrained(model_name).to(device)
         processor = AutoProcessor.from_pretrained(model_name)
@@ -270,3 +268,163 @@ class AudioVisualizer:
         plt.suptitle(title)
         plt.tight_layout()
         plt.show()
+
+
+class AudioFidelityEvaluator:
+    """
+    A non-trainable utility class that bundles all multi-resolution spectral
+    loss functions for high-fidelity audio training.
+    """
+
+    def __init__(self, encodec, sample_rate=44100, device="cpu"):
+        self.device = device
+        self.encodec = encodec
+
+        # Multi-resolution STFT configurations
+        self.stft_fft_sizes = [512, 1024, 2048]
+        self.stft_hop_sizes = [50, 120, 240]
+        self.stft_win_sizes = [240, 600, 1200]
+
+        # Pre-instantiate Mel-spectrogram transforms directly on the target device
+        self.mel_transforms = [
+            T.MelSpectrogram(
+                sample_rate=sample_rate,
+                n_fft=1024,
+                win_length=1024,
+                hop_length=256,
+                n_mels=80,
+            ).to(device),
+            T.MelSpectrogram(
+                sample_rate=sample_rate,
+                n_fft=2048,
+                win_length=2048,
+                hop_length=512,
+                n_mels=128,
+            ).to(device),
+        ]
+
+    def _stft_loss(self, pred, target):
+        """Calculates multi-resolution spectral convergence and log magnitude loss."""
+        stft_loss_val = 0.0
+        for f, h, w in zip(
+            self.stft_fft_sizes, self.stft_hop_sizes, self.stft_win_sizes
+        ):
+            window = torch.hann_window(w).to(pred.device)
+
+            p_stft = torch.stft(
+                pred.squeeze(1),
+                n_fft=f,
+                hop_length=h,
+                win_length=w,
+                window=window,
+                return_complex=True,
+            )
+            t_stft = torch.stft(
+                target.squeeze(1),
+                n_fft=f,
+                hop_length=h,
+                win_length=w,
+                window=window,
+                return_complex=True,
+            )
+
+            p_mag = torch.abs(p_stft) + 1e-7
+            t_mag = torch.abs(t_stft) + 1e-7
+
+            sc_loss = torch.norm(t_mag - p_mag, p="fro") / (
+                torch.norm(t_mag, p="fro") + 1e-9
+            )
+            log_mag_loss = torch.mean(torch.abs(torch.log(t_mag) - torch.log(p_mag)))
+
+            stft_loss_val += sc_loss + log_mag_loss
+
+        return stft_loss_val / len(self.stft_fft_sizes)
+
+    def _mel_loss(self, pred, target):
+        mel_loss_val = 0.0
+        for mel_transform in self.mel_transforms:
+            p_mel = mel_transform(pred.squeeze(1))
+            t_mel = mel_transform(target.squeeze(1))
+
+            # Convert to log-scale to normalize loss magnitude
+            p_mel_log = torch.log(p_mel + 1e-5)
+            t_mel_log = torch.log(t_mel + 1e-5)
+
+            mel_loss_val += torch.mean(torch.abs(p_mel_log - t_mel_log))
+        return mel_loss_val / len(self.mel_transforms)
+
+    def compute(self, pred_noise, target_noise, z_t=None, a_bar=None, z_0=None):
+        """
+        Computes diffusion MSE + optional audio-domain perceptual losses.
+
+        pred_noise: Predicted noise from diffusion model [B, 128, 128]
+        target_noise: True noise [B, 128, 128]
+        z_t: Noisy latent [B, 128, 128]
+        a_bar: Cumulative alpha value [B, 1, 1]
+        z_0: Clean latent [B, 128, 128]
+        """
+
+        def combine_losses(loss_mse, loss_stft, loss_mel):
+            # Local weights
+            mse_weight = 0.8
+            stft_weight = 1.2
+            mel_weight = 1.0
+
+            # Weighted contributions
+            mse_term = mse_weight * loss_mse
+            stft_term = stft_weight * loss_stft
+            mel_term = mel_weight * loss_mel
+
+            total = mse_term + stft_term + mel_term
+
+            msg = (
+                f"total_loss={total.item():.3f} = "
+                f"{mse_weight:g}*mse={loss_mse.item():.3f} + "
+                f"{stft_weight:g}*stft={loss_stft.item():.3f} + "
+                f"{mel_weight:g}*mel={loss_mel.item():.3f} = "
+                f"{mse_term.item():.3f} + {stft_term.item():.3f} + {mel_term.item():.3f}"
+            )
+
+
+            return total, msg
+
+        # 1. Standard diffusion noise prediction loss
+        loss_mse = torch.mean((pred_noise - target_noise) ** 2)
+
+        # 2. Audio perceptual losses (only if latent context is available)
+        if z_t is not None and a_bar is not None and z_0 is not None:
+
+            sqrt_one_minus_a_bar = torch.sqrt(1.0 - a_bar)
+            sqrt_a_bar = torch.sqrt(a_bar)
+
+            # Predict clean latent z0 from predicted noise
+            z_0_pred = (z_t - sqrt_one_minus_a_bar * pred_noise) / (sqrt_a_bar + 1e-9)
+
+            batch_size = z_0.shape[0]
+            perceptual_batch = max(batch_size // 16, 1)
+
+            z0_pred_loss = z_0_pred[:perceptual_batch]
+            z0_loss = z_0[:perceptual_batch]
+
+            with torch.no_grad():
+                audio_t = self.encodec.decoder(z0_loss)
+
+            with torch.backends.cudnn.flags(enabled=False):
+                audio_p = self.encodec.decoder(z0_pred_loss)
+
+            if audio_p.dim() == 2:
+                audio_p = audio_p.unsqueeze(1)
+
+            if audio_t.dim() == 2:
+                audio_t = audio_t.unsqueeze(1)
+
+            # Spectral losses
+            loss_stft = self._stft_loss(audio_p, audio_t)
+            loss_mel = self._mel_loss(audio_p, audio_t)
+
+            total_loss, loss_msg = combine_losses(loss_mse, loss_stft, loss_mel)
+
+            return total_loss, loss_msg
+
+        # Fallback: pure diffusion loss
+        return loss_mse, None
