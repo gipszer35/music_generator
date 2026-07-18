@@ -31,8 +31,8 @@ class Config:
     latent_channels = 128
     downsampling_factor = 320
     epochs: int = 2_000_000
-    timesteps: int = 700
-    lr: float = 5e-5
+    timesteps: int = 400
+    lr: float = 5e-4
 
     @property
     def out_dir(self):
@@ -52,7 +52,7 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         work_dir = root_dir + "MusicGenerator/"
-        batch_size = 256 + 128
+        batch_size = 256 + 64
     else:
         root_dir = "./"
         work_dir = root_dir
@@ -239,10 +239,19 @@ class DiffusionWaveTrainer:
         model = DiffusionWave(
             in_channels=128, model_channels=128, time_hidden_size=512
         ).to(my.DEVICE)
-        self.model, self.optimizer = self.checkpoint_manager.load_model(model)
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+        self.model, self.optimizer = self.checkpoint_manager.load_model(
+            model, optimizer
+        )
         my.print_parameter_summary(self.model)
         self.evaluator = audio_common.AudioFidelityEvaluator(
-            self.encodec, sample_rate=44100, device=my.DEVICE
+            self.encodec,
+            sample_rate=44100,
+            device=my.DEVICE,
+            mse_weight=1.0,
+            stft_weight=0.0,
+            mel_weight=0.0,
         )
 
         self.loss_history = deque(maxlen=1000)
@@ -345,7 +354,7 @@ class DiffusionWaveTrainer:
 
                 avg_loss = self.update_avg_loss(loss.item())
 
-                if step % 20 == 0:
+                if step % 50 == 0:
                     self.model.eval()
 
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)

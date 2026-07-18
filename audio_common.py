@@ -154,9 +154,7 @@ class CheckpointManager:
             except Exception as e:
                 self.logger.info(f"Optimizer state not loaded: {e}")
 
-    def load_model(self, model):
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+    def load_model(self, model, optimizer):
 
         if os.path.exists(self.model_file):
             self.load_checkpoint(model, optimizer)
@@ -276,9 +274,20 @@ class AudioFidelityEvaluator:
     loss functions for high-fidelity audio training.
     """
 
-    def __init__(self, encodec, sample_rate=44100, device="cpu"):
+    def __init__(
+        self,
+        encodec,
+        sample_rate=44100,
+        device="cpu",
+        mse_weight=1.0,
+        stft_weight=1.0,
+        mel_weight=1.0,
+    ):
         self.device = device
         self.encodec = encodec
+        self.mse_weight = mse_weight
+        self.stft_weight = stft_weight
+        self.mel_weight = mel_weight
 
         # Multi-resolution STFT configurations
         self.stft_fft_sizes = [512, 1024, 2048]
@@ -365,26 +374,20 @@ class AudioFidelityEvaluator:
         """
 
         def combine_losses(loss_mse, loss_stft, loss_mel):
-            # Local weights
-            mse_weight = 0.8
-            stft_weight = 1.2
-            mel_weight = 1.0
-
             # Weighted contributions
-            mse_term = mse_weight * loss_mse
-            stft_term = stft_weight * loss_stft
-            mel_term = mel_weight * loss_mel
+            mse_term = self.mse_weight * loss_mse
+            stft_term = self.stft_weight * loss_stft
+            mel_term = self.mel_weight * loss_mel
 
             total = mse_term + stft_term + mel_term
 
             msg = (
                 f"total_loss={total.item():.3f} = "
-                f"{mse_weight:g}*mse={loss_mse.item():.3f} + "
-                f"{stft_weight:g}*stft={loss_stft.item():.3f} + "
-                f"{mel_weight:g}*mel={loss_mel.item():.3f} = "
+                f"{self.mse_weight:g}*mse={loss_mse.item():.3f} + "
+                f"{self.stft_weight:g}*stft={loss_stft.item():.3f} + "
+                f"{self.mel_weight:g}*mel={loss_mel.item():.3f} = "
                 f"{mse_term.item():.3f} + {stft_term.item():.3f} + {mel_term.item():.3f}"
             )
-
 
             return total, msg
 
