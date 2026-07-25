@@ -217,7 +217,7 @@ class TransformerAudioModel(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, codes, max_new_tokens):
+    def generate(self, codes, max_new_tokens, bos_token):
         B, T = codes.shape
 
         idx = codes
@@ -229,6 +229,9 @@ class TransformerAudioModel(nn.Module):
                 idx_cond = idx
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
+            # Prevent BOS from being generated after the start token.
+            logits[:, bos_token] = -float("inf")
+
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
 
@@ -261,12 +264,20 @@ class TransformerAudioTrainer:
             model_file=config.model_file, lr=config.lr, device=my.DEVICE, logger=logger
         )
 
-        # Vocabulary size depends on the EnCodec configuration (typically 1024)
         self.vocab_size = self.encodec.config.codebook_size
+
+        # Add a special BOS (beginning-of-sequence) token for starting generation.
+        # Increase model vocabulary size to include BOS. Sequences start as:
+        # [BOS, 34, 45, ...]
+        self.bos_token = self.vocab_size
+        self.model_vocab_size = self.vocab_size + 1
+
         self.num_codebooks = self.encodec.config.num_quantizers
 
         # Instantiate the generative transformer model
-        self.model = TransformerAudioModel(vocab_size=self.vocab_size).to(my.DEVICE)
+        self.model = TransformerAudioModel(vocab_size=self.model_vocab_size).to(
+            my.DEVICE
+        )
         self.evaluator = audio_common.AudioFidelityEvaluator(
             self.encodec, sample_rate=self.sr, device=my.DEVICE
         )
@@ -307,7 +318,6 @@ class TransformerAudioTrainer:
             for batch_idx, batch in enumerate(self.loader):
                 # Extract raw continuous audio from the EnCodec processor/collator output
                 waveform = batch["input_values"].to(my.DEVICE)
-
                 # Extract discrete acoustic tokens (codes) using the EnCodec Encoder
                 with torch.no_grad():
                     encoder_outputs = self.encodec.encode(waveform)
@@ -316,9 +326,16 @@ class TransformerAudioTrainer:
                     codes = codes.squeeze(0)
                     # keep codebook 0
                     codes = codes[:, 0, :]
-
-                    idx = codes[:, :-1]
-                    targets = codes[:, 1:]
+                    B, T = codes.shape
+                    # Start sequence with BOS token.
+                    bos_tokens = torch.full(
+                        (B, 1),
+                        self.bos_token,
+                        dtype=torch.long,
+                        device=my.DEVICE,
+                    )
+                    idx = torch.cat([bos_tokens, codes[:, :-1]], dim=1)
+                    targets = codes
 
                 self.optimizer.zero_grad(set_to_none=True)
                 with torch.cuda.amp.autocast():
@@ -352,9 +369,10 @@ class TransformerAudioTrainer:
                         f"Avg Loss: {avg_loss:.4f}"
                     )
 
-                    # Generate an audio sample using the prime context from current batch
-                    # Passing a sub-slice of the current batch as seed tokens (first 10 timesteps)
-                    prime_tokens = codes[:1, :10]
+                    # Generate an audio sample from scratch using the BOS token as the initial context.
+                    # The model learns to start generation after the BOS (beginning-of-sequence) token.
+                    prime_tokens = torch.tensor([[self.bos_token]], device=my.DEVICE)
+
                     generated_wave = self.generate_audio(
                         prime_tokens, max_new_tokens=200
                     )
@@ -367,22 +385,22 @@ class TransformerAudioTrainer:
 
                     self.model.train()
 
-                if batch_idx % 10 == 0 and step % 20 != 0:
-                    logger.info(
-                        f"Epoch {epoch} | Batch {batch_idx}/{len(self.loader)} | Loss: {loss.item():.4f}"
-                    )
-
             logger.info(f"Epoch {epoch} completed.")
 
     @torch.no_grad()
     def generate_audio(self, prime_tokens, max_new_tokens):
         self.model.eval()
 
-        generated_cb0 = self.model.generate(prime_tokens.to(my.DEVICE), max_new_tokens)
+        generated_cb0 = self.model.generate(
+            prime_tokens.to(my.DEVICE), max_new_tokens, self.bos_token
+        )
 
+        # Remove BOS token because EnCodec decoder only understands audio tokens.
+        generated_cb0 = generated_cb0[:, 1:]
         B, T = generated_cb0.shape
 
-        # recreate EnCodec shape
+        # Recreate EnCodec shape. Since we only generate CB0, fill the remaining
+        # codebooks with zeros for decoding.
         generated_codes = torch.zeros(
             1, B, self.num_codebooks, T, dtype=torch.long, device=my.DEVICE
         )
