@@ -32,10 +32,10 @@ class Config:
     latent_channels = 128
     downsampling_factor = 320
     epochs: int = 2_000_000
-    lr: float = 5e-5
+    lr: float = 1e-4
 
     n_embed: int = 512  # Embedding dimension for the transformer
-    block_size: int = 2048  # Maximum sequence length (S * K) the transformer can accept
+    block_size: int = 2048  # Maximum sequence length
     n_head: int = 8  # Number of attention heads
     n_layer: int = 6  # Number of transformer blocks
     dropout: float = 0.1  # Dropout rate
@@ -227,6 +227,7 @@ class TransformerAudioModel(nn.Module):
                 idx_cond = idx[:, -config.block_size :]
             else:
                 idx_cond = idx
+
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
             # Prevent BOS from being generated after the start token.
@@ -356,8 +357,7 @@ class TransformerAudioTrainer:
                 avg_loss = self.update_avg_loss(loss.item())
                 step += 1  # Increment the global step counter
 
-                # Periodic evaluation, saving, logging, and visualization every 20 steps
-                if step % 20 == 0:
+                if step % 50 == 0:
                     self.model.eval()
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)
 
@@ -369,9 +369,23 @@ class TransformerAudioTrainer:
                         f"Avg Loss: {avg_loss:.4f}"
                     )
 
-                    # Generate an audio sample from scratch using the BOS token as the initial context.
-                    # The model learns to start generation after the BOS (beginning-of-sequence) token.
-                    prime_tokens = torch.tensor([[self.bos_token]], device=my.DEVICE)
+                    from_scratch = True
+
+                    if from_scratch:
+                        # Generate an audio sample from scratch using the BOS token as the initial context.
+                        # The model learns to start generation after the BOS (beginning-of-sequence) token.
+                        prime_tokens = torch.tensor([[self.bos_token]], device=my.DEVICE)
+                    else:
+                        # Prime with the first half of the current sample, prefixed with BOS.
+                        B, T = codes.shape
+                        bos_tokens = torch.full(
+                            (1, 1),
+                            self.bos_token,
+                            dtype=torch.long,
+                            device=my.DEVICE,
+                        )
+                        prime_tokens = torch.cat([bos_tokens, codes[:1, : T // 2]], dim=1)
+
 
                     generated_wave = self.generate_audio(
                         prime_tokens, max_new_tokens=200
