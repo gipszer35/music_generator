@@ -28,16 +28,16 @@ class Config:
     work_dir: str
     batch_size: int
 
-    clip_len: int = 40960  # divide this by sample rate to get the length in sec
+    clip_len: int = 40960 # divide this by sample rate to get the length in sec
     latent_channels = 128
     downsampling_factor = 320
     epochs: int = 2_000_000
     lr: float = 1e-4
 
-    n_embed: int = 512  # Embedding dimension for the transformer
+    n_embed: int = 768  # Embedding dimension for the transformer
     block_size: int = 2048  # Maximum sequence length
-    n_head: int = 8  # Number of attention heads
-    n_layer: int = 6  # Number of transformer blocks
+    n_head: int = 6  # Number of attention heads
+    n_layer: int = 10  # Number of transformer blocks
     dropout: float = 0.1  # Dropout rate
 
     @property
@@ -46,7 +46,7 @@ class Config:
 
     @property
     def model_file(self):
-        return os.path.join(self.out_dir, "transformer_audio.pt")
+        return os.path.join(self.out_dir, "transformer_max_audio.pt")
 
 
 def create_config() -> Config:
@@ -58,7 +58,7 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         work_dir = root_dir + "MusicGenerator/"
-        batch_size = 256
+        batch_size = 192
     else:
         root_dir = "./"
         work_dir = root_dir
@@ -274,6 +274,8 @@ class TransformerAudioTrainer:
         self.model_vocab_size = self.vocab_size + 1
 
         self.num_codebooks = self.encodec.config.num_quantizers
+        self.num_codebooks = 2
+
 
         # Instantiate the generative transformer model
         self.model = TransformerAudioModel(vocab_size=self.model_vocab_size).to(
@@ -357,7 +359,7 @@ class TransformerAudioTrainer:
                 avg_loss = self.update_avg_loss(loss.item())
                 step += 1  # Increment the global step counter
 
-                if step % 50 == 0:
+                if step % 30 == 0:
                     self.model.eval()
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)
 
@@ -388,7 +390,7 @@ class TransformerAudioTrainer:
 
 
                     generated_wave = self.generate_audio(
-                        prime_tokens, max_new_tokens=200
+                        prime_tokens, max_new_tokens=680
                     )
                     generated_sample = generated_wave.cpu().squeeze().numpy()
 

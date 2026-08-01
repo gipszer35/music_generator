@@ -42,39 +42,20 @@ def ensure_dir(path, logger):
         logger.info(f"Created directory: {path}")
 
 
-class NSynthSubset(Dataset):
-    URL = "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz"
-    ARCHIVE = "nsynth-test.jsonwav.tar.gz"
-    DATASET_DIR = "nsynth-test"
-
-    def __init__(self, sample_rate: int, clip_len, out_dir):
+class MusicDataset(Dataset):
+    def __init__(self, sample_rate: int, clip_len, out_dir, data_dir="training-data"):
         self.sample_rate = sample_rate
         self.clip_len = clip_len
         self.out_dir = out_dir
+        self.data_dir = data_dir
 
-        NSynthSubset._prepare(self.out_dir)
-
-        audio_dir = os.path.join(self.out_dir, self.DATASET_DIR, "audio")
+        audio_dir = os.path.join(self.out_dir, self.data_dir, "audio")
 
         self.paths = [
             os.path.join(audio_dir, f)
             for f in os.listdir(audio_dir)
             if f.endswith(".wav")
         ]
-
-    @classmethod
-    def _prepare(cls, out_dir):
-        archive = os.path.join(out_dir, cls.ARCHIVE)
-        dataset_dir = os.path.join(out_dir, cls.DATASET_DIR)
-
-        if not os.path.isdir(dataset_dir):
-            if not os.path.isfile(archive):
-                print("Downloading NSynth...")
-                urllib.request.urlretrieve(cls.URL, archive)
-
-            print("Extracting NSynth...")
-            with tarfile.open(archive, "r:gz") as tar:
-                tar.extractall(out_dir)
 
     def __len__(self):
         return len(self.paths)
@@ -109,6 +90,30 @@ class NSynthSubset(Dataset):
             wav = wav / peak
 
         return wav
+
+
+class NSynthSubset(MusicDataset):
+    URL = "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz"
+    ARCHIVE = "nsynth-test.jsonwav.tar.gz"
+
+    def __init__(self, sample_rate: int, clip_len, out_dir):
+        data_dir = "nsynth-test"
+        NSynthSubset._prepare(out_dir)
+        super().__init__(self, sample_rate, clip_len, out_dir, data_dir)
+
+    @classmethod
+    def _prepare(cls, out_dir):
+        archive = os.path.join(out_dir, cls.ARCHIVE)
+        dataset_dir = os.path.join(out_dir, cls.DATASET_DIR)
+
+        if not os.path.isdir(dataset_dir):
+            if not os.path.isfile(archive):
+                print("Downloading NSynth...")
+                urllib.request.urlretrieve(cls.URL, archive)
+
+            print("Extracting NSynth...")
+            with tarfile.open(archive, "r:gz") as tar:
+                tar.extractall(out_dir)
 
 
 class DACCollator:
