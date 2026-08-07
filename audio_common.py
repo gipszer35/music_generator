@@ -49,7 +49,7 @@ class MusicDataset(Dataset):
         self.out_dir = out_dir
         self.data_dir = data_dir
 
-        audio_dir = os.path.join(self.out_dir, self.data_dir, "audio")
+        audio_dir = os.path.join(self.out_dir, self.data_dir)
 
         self.paths = [
             os.path.join(audio_dir, f)
@@ -95,21 +95,20 @@ class MusicDataset(Dataset):
 class NSynthSubset(MusicDataset):
     URL = "http://download.magenta.tensorflow.org/datasets/nsynth/nsynth-test.jsonwav.tar.gz"
     ARCHIVE = "nsynth-test.jsonwav.tar.gz"
+    DATA_DIR = "nsynth-test/audio"
 
     def __init__(self, sample_rate: int, clip_len, out_dir):
-        data_dir = "nsynth-test"
-        NSynthSubset._prepare(out_dir)
-        super().__init__(self, sample_rate, clip_len, out_dir, data_dir)
+        self._prepare(out_dir)
+        super().__init__(sample_rate, clip_len, out_dir, self.DATA_DIR)
 
-    @classmethod
-    def _prepare(cls, out_dir):
-        archive = os.path.join(out_dir, cls.ARCHIVE)
-        dataset_dir = os.path.join(out_dir, cls.DATASET_DIR)
+    def _prepare(self, out_dir):
+        archive = os.path.join(out_dir, self.ARCHIVE)
+        dataset_dir = os.path.join(out_dir, self.DATA_DIR)
 
         if not os.path.isdir(dataset_dir):
             if not os.path.isfile(archive):
                 print("Downloading NSynth...")
-                urllib.request.urlretrieve(cls.URL, archive)
+                urllib.request.urlretrieve(self.URL, archive)
 
             print("Extracting NSynth...")
             with tarfile.open(archive, "r:gz") as tar:

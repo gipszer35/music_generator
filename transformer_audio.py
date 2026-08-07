@@ -21,23 +21,22 @@ import torch.nn.functional as F
 def is_colab():
     return "COLAB_GPU" in os.environ
 
-
 @dataclass
 class Config:
     root_dir: str
     work_dir: str
     batch_size: int
 
-    clip_len: int = 40960 # divide this by sample rate to get the length in sec
+    clip_len: int = 24000 * 12 # divide this by sample rate to get the length in sec
     latent_channels = 128
     downsampling_factor = 320
     epochs: int = 2_000_000
-    lr: float = 1e-4
+    lr: float = 2e-4
 
     n_embed: int = 768  # Embedding dimension for the transformer
     block_size: int = 2048  # Maximum sequence length
-    n_head: int = 6  # Number of attention heads
-    n_layer: int = 10  # Number of transformer blocks
+    n_head: int = 12  # Number of attention heads
+    n_layer: int = 16  # Number of transformer blocks
     dropout: float = 0.1  # Dropout rate
 
     @property
@@ -58,11 +57,11 @@ def create_config() -> Config:
 
         root_dir = "/content/drive/MyDrive/"
         work_dir = root_dir + "MusicGenerator/"
-        batch_size = 192
+        batch_size = 16
     else:
         root_dir = "./"
         work_dir = root_dir
-        batch_size = 3
+        batch_size = 2
 
     return Config(root_dir=root_dir, work_dir=work_dir, batch_size=batch_size)
 
@@ -185,11 +184,11 @@ class TransformerAudioModel(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.01)
 
     def forward(self, idx, targets=None):
         tok_emb = self.token_embedding_table(idx)
@@ -248,7 +247,7 @@ class TransformerAudioTrainer:
         self.encodec = audio_codec_components.model
         self.sr = self.processor.sampling_rate
 
-        self.dataset = audio_common.NSynthSubset(
+        self.dataset = audio_common.MusicDataset(
             sample_rate=self.sr, clip_len=config.clip_len, out_dir=config.out_dir
         )
 
@@ -313,6 +312,7 @@ class TransformerAudioTrainer:
             f"Number of data samples: {len(self.dataset)}\n"
             f"Batch Size: {config.batch_size}\n"
             f"Batches per epoch: {len(self.loader)}\n"
+            f"Sample Rate: {self.sr}\n"
             f"LR: {config.lr}"
         )
 
@@ -359,7 +359,7 @@ class TransformerAudioTrainer:
                 avg_loss = self.update_avg_loss(loss.item())
                 step += 1  # Increment the global step counter
 
-                if step % 30 == 0:
+                if step % 100 == 0:
                     self.model.eval()
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)
 
@@ -390,7 +390,7 @@ class TransformerAudioTrainer:
 
 
                     generated_wave = self.generate_audio(
-                        prime_tokens, max_new_tokens=680
+                        prime_tokens, max_new_tokens=850
                     )
                     generated_sample = generated_wave.cpu().squeeze().numpy()
 
