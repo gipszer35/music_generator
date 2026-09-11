@@ -56,7 +56,7 @@ def create_config() -> Config:
             drive.mount("/content/drive")
 
         root_dir = "/content/drive/MyDrive/"
-        work_dir = root_dir + "MusicGenerator/"
+        work_dir = root_dir + "apps-audio/"
         batch_size = 24
     else:
         root_dir = "./"
@@ -69,11 +69,11 @@ def create_config() -> Config:
 config = create_config()
 sys.path.append(config.root_dir)
 sys.path.append(config.work_dir)
-import my_common as my
-import audio_common
+import common
+import audio_utils
 
 
-logger = my.create_logger()
+logger = common.create_logger()
 
 
 class EfficientAttention(nn.Module):
@@ -196,7 +196,7 @@ class TransformerAudioModel(nn.Module):
         B, T, C = tok_emb.shape
 
         pos_emb = self.position_embedding_table(
-            torch.arange(T, device=my.DEVICE)
+            torch.arange(T, device=common.DEVICE)
         )  # (T,C)
         x = tok_emb + pos_emb  # (B,T,C)
         x = self.blocks(x)  # (B,T,C)
@@ -242,12 +242,12 @@ class TransformerAudioModel(nn.Module):
 
 class TransformerAudioTrainer:
     def __init__(self):
-        audio_codec_components = audio_common.AudioCodecFactory.create(my.DEVICE)
+        audio_codec_components = audio_utils.AudioCodecFactory.create(common.DEVICE)
         self.processor = audio_codec_components.processor
         self.encodec = audio_codec_components.model
         self.sr = self.processor.sampling_rate
 
-        self.dataset = audio_common.MusicDataset(
+        self.dataset = audio_utils.MusicDataset(
             sample_rate=self.sr, clip_len=config.clip_len, out_dir=config.out_dir
         )
 
@@ -255,13 +255,13 @@ class TransformerAudioTrainer:
             self.dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            collate_fn=audio_common.DACCollator(self.processor),
+            collate_fn=audio_utils.DACCollator(self.processor),
             num_workers=2,
             persistent_workers=True,  # Prevents RAM leaks across epochs
         )
 
-        self.checkpoint_manager = audio_common.CheckpointManager(
-            model_file=config.model_file, lr=config.lr, device=my.DEVICE, logger=logger
+        self.checkpoint_manager = audio_utils.CheckpointManager(
+            model_file=config.model_file, lr=config.lr, device=common.DEVICE, logger=logger
         )
 
         self.vocab_size = self.encodec.config.codebook_size
@@ -278,10 +278,10 @@ class TransformerAudioTrainer:
 
         # Instantiate the generative transformer model
         self.model = TransformerAudioModel(vocab_size=self.model_vocab_size).to(
-            my.DEVICE
+            common.DEVICE
         )
-        self.evaluator = audio_common.AudioFidelityEvaluator(
-            self.encodec, sample_rate=self.sr, device=my.DEVICE
+        self.evaluator = audio_utils.AudioFidelityEvaluator(
+            self.encodec, sample_rate=self.sr, device=common.DEVICE
         )
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
         self.scaler = torch.cuda.amp.GradScaler()
@@ -290,13 +290,13 @@ class TransformerAudioTrainer:
             self.model, self.optimizer
         )
 
-        my.print_parameter_summary(self.model)
-        self.evaluator = audio_common.AudioFidelityEvaluator(
-            self.encodec, sample_rate=self.sr, device=my.DEVICE
+        common.print_parameter_summary(self.model)
+        self.evaluator = audio_utils.AudioFidelityEvaluator(
+            self.encodec, sample_rate=self.sr, device=common.DEVICE
         )
 
         self.loss_history = deque(maxlen=1000)
-        self.visualizer = audio_common.AudioVisualizer(logger=logger)
+        self.visualizer = audio_utils.AudioVisualizer(logger=logger)
 
         self.start_epoch = 0
 
@@ -320,7 +320,7 @@ class TransformerAudioTrainer:
 
             for batch_idx, batch in enumerate(self.loader):
                 # Extract raw continuous audio from the EnCodec processor/collator output
-                waveform = batch["input_values"].to(my.DEVICE)
+                waveform = batch["input_values"].to(common.DEVICE)
                 # Extract discrete acoustic tokens (codes) using the EnCodec Encoder
                 with torch.no_grad():
                     encoder_outputs = self.encodec.encode(waveform)
@@ -335,7 +335,7 @@ class TransformerAudioTrainer:
                         (B, 1),
                         self.bos_token,
                         dtype=torch.long,
-                        device=my.DEVICE,
+                        device=common.DEVICE,
                     )
                     idx = torch.cat([bos_tokens, codes[:, :-1]], dim=1)
                     targets = codes
@@ -359,7 +359,7 @@ class TransformerAudioTrainer:
                 avg_loss = self.update_avg_loss(loss.item())
                 step += 1  # Increment the global step counter
 
-                if step % 200 == 0:
+                if step % 500 == 0:
                     self.model.eval()
                     self.checkpoint_manager.save_checkpoint(self.model, self.optimizer)
 
@@ -376,7 +376,7 @@ class TransformerAudioTrainer:
                     if from_scratch:
                         # Generate an audio sample from scratch using the BOS token as the initial context.
                         # The model learns to start generation after the BOS (beginning-of-sequence) token.
-                        prime_tokens = torch.tensor([[self.bos_token]], device=my.DEVICE)
+                        prime_tokens = torch.tensor([[self.bos_token]], device=common.DEVICE)
                     else:
                         # Prime with the first half of the current sample, prefixed with BOS.
                         B, T = codes.shape
@@ -384,7 +384,7 @@ class TransformerAudioTrainer:
                             (1, 1),
                             self.bos_token,
                             dtype=torch.long,
-                            device=my.DEVICE,
+                            device=common.DEVICE,
                         )
                         prime_tokens = torch.cat([bos_tokens, codes[:1, : T // 2]], dim=1)
 
@@ -408,7 +408,7 @@ class TransformerAudioTrainer:
         self.model.eval()
 
         generated_cb0 = self.model.generate(
-            prime_tokens.to(my.DEVICE), max_new_tokens, self.bos_token
+            prime_tokens.to(common.DEVICE), max_new_tokens, self.bos_token
         )
 
         # Remove BOS token because EnCodec decoder only understands audio tokens.
@@ -418,7 +418,7 @@ class TransformerAudioTrainer:
         # Recreate EnCodec shape. Since we only generate CB0, fill the remaining
         # codebooks with zeros for decoding.
         generated_codes = torch.zeros(
-            1, B, self.num_codebooks, T, dtype=torch.long, device=my.DEVICE
+            1, B, self.num_codebooks, T, dtype=torch.long, device=common.DEVICE
         )
 
         # put generated tokens into codebook 0
@@ -429,7 +429,7 @@ class TransformerAudioTrainer:
 
 
 def train():
-    audio_common.ensure_dir(config.out_dir, logger=logger)
+    audio_utils.ensure_dir(config.out_dir, logger=logger)
     trainer = TransformerAudioTrainer()
     trainer.train()
 

@@ -51,7 +51,7 @@ def create_config() -> Config:
             drive.mount("/content/drive")
 
         root_dir = "/content/drive/MyDrive/"
-        work_dir = root_dir + "MusicGenerator/"
+        work_dir = root_dir + "apps-audio/"
         batch_size = 256 + 64
     else:
         root_dir = "./"
@@ -63,7 +63,7 @@ def create_config() -> Config:
 
 class DiffusionSchedule:
     def __init__(self, device, timesteps):
-        self.betas = my.cosine_beta_schedule(timesteps).to(device)
+        self.betas = common.cosine_beta_schedule(timesteps).to(device)
         self.alphas = 1.0 - self.betas
         self.alpha_bars = torch.cumprod(self.alphas, dim=0)
 
@@ -77,12 +77,12 @@ class DiffusionSchedule:
 config = create_config()
 sys.path.append(config.root_dir)
 sys.path.append(config.work_dir)
-import my_common as my
-import audio_common
+import common
+import audio_utils
 
 
-schedule = DiffusionSchedule(my.DEVICE, config.timesteps)
-logger = my.create_logger()
+schedule = DiffusionSchedule(common.DEVICE, config.timesteps)
+logger = common.create_logger()
 
 
 class SnakeActivation(nn.Module):
@@ -124,7 +124,7 @@ class UNetBlock1D(nn.Module):
 class DiffusionWave(nn.Module):
     def __init__(self, *, in_channels, model_channels, time_hidden_size):
         super().__init__()
-        self.time_mlp = my.TimestepEmbedder(hidden_size=time_hidden_size)
+        self.time_mlp = common.TimestepEmbedder(hidden_size=time_hidden_size)
 
         # New channel multipliers
         c1 = model_channels
@@ -215,12 +215,12 @@ class DiffusionWave(nn.Module):
 
 class DiffusionWaveTrainer:
     def __init__(self):
-        audio_codec_components = audio_common.AudioCodecFactory.create(my.DEVICE)
+        audio_codec_components = audio_utils.AudioCodecFactory.create(common.DEVICE)
         self.processor = audio_codec_components.processor
         self.encodec = audio_codec_components.model
         self.sr = self.processor.sampling_rate
 
-        self.dataset = audio_common.NSynthSubset(
+        self.dataset = audio_utils.NSynthSubset(
             sample_rate=self.sr, clip_len=config.clip_len, out_dir=config.out_dir
         )
 
@@ -228,34 +228,34 @@ class DiffusionWaveTrainer:
             self.dataset,
             batch_size=config.batch_size,
             shuffle=True,
-            collate_fn=audio_common.DACCollator(self.processor),
+            collate_fn=audio_utils.DACCollator(self.processor),
             num_workers=2,
             persistent_workers=True,  # Prevents RAM leaks across epochs
         )
 
-        self.checkpoint_manager = audio_common.CheckpointManager(
-            model_file=config.model_file, lr=config.lr, device=my.DEVICE, logger=logger
+        self.checkpoint_manager = audio_utils.CheckpointManager(
+            model_file=config.model_file, lr=config.lr, device=common.DEVICE, logger=logger
         )
         model = DiffusionWave(
             in_channels=128, model_channels=128, time_hidden_size=512
-        ).to(my.DEVICE)
+        ).to(common.DEVICE)
         optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
         self.model, self.optimizer = self.checkpoint_manager.load_model(
             model, optimizer
         )
-        my.print_parameter_summary(self.model)
-        self.evaluator = audio_common.AudioFidelityEvaluator(
+        common.print_parameter_summary(self.model)
+        self.evaluator = audio_utils.AudioFidelityEvaluator(
             self.encodec,
             sample_rate=44100,
-            device=my.DEVICE,
+            device=common.DEVICE,
             mse_weight=1.0,
             stft_weight=0.0,
             mel_weight=0.0,
         )
 
         self.loss_history = deque(maxlen=1000)
-        self.visualizer = audio_common.AudioVisualizer(logger=logger)
+        self.visualizer = audio_utils.AudioVisualizer(logger=logger)
 
     @torch.no_grad()
     def sample(self):
@@ -264,10 +264,10 @@ class DiffusionWaveTrainer:
             config.latent_channels,
             config.clip_len // config.downsampling_factor,
         )
-        x_t = torch.randn(shape).to(my.DEVICE)
+        x_t = torch.randn(shape).to(common.DEVICE)
 
         for t in reversed(range(config.timesteps)):
-            t_tensor = torch.full((shape[0],), t, device=my.DEVICE, dtype=torch.long)
+            t_tensor = torch.full((shape[0],), t, device=common.DEVICE, dtype=torch.long)
             pred_noise = self.model(x_t, t_tensor)
 
             alpha = schedule.get_alpha(t)
@@ -328,12 +328,12 @@ class DiffusionWaveTrainer:
 
         for epoch in range(config.epochs):
             for _, batch in enumerate(self.loader):
-                waveform = batch["input_values"].to(my.DEVICE)
+                waveform = batch["input_values"].to(common.DEVICE)
 
                 with torch.no_grad():
                     z_0 = self.encodec.encoder(waveform)  # continuous latent
 
-                t = torch.randint(0, config.timesteps, (z_0.size(0),), device=my.DEVICE)
+                t = torch.randint(0, config.timesteps, (z_0.size(0),), device=common.DEVICE)
 
                 noise = torch.randn_like(z_0)
 
@@ -379,7 +379,7 @@ class DiffusionWaveTrainer:
 
 
 def train():
-    audio_common.ensure_dir(config.out_dir, logger=logger)
+    audio_utils.ensure_dir(config.out_dir, logger=logger)
     trainer = DiffusionWaveTrainer()
     trainer.train()
 
